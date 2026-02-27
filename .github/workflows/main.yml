@@ -5,112 +5,88 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
-        shell: pwsh
+      - name: Install Desktop + XRDP
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies xrdp dbus-x11
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          Restart-Service -Name TermService -Force
+          echo "startxfce4" | sudo tee /etc/skel/.xsession
+          echo "startxfce4" > ~/.xsession
 
       - name: Create RDP User with Secure Password
-        shell: pwsh
         run: |
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 16)
 
-          $raw = @()
-          $raw += $charSet.Upper   | Get-Random -Count 4
-          $raw += $charSet.Lower   | Get-Random -Count 4
-          $raw += $charSet.Number  | Get-Random -Count 4
-          $raw += $charSet.Special | Get-Random -Count 4
+          if id "rdpuser" &>/dev/null; then
+            sudo userdel -r rdpuser 2>/dev/null || true
+          fi
 
-          $password  = -join ($raw | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP"
-          }
+          echo "startxfce4" | sudo tee /home/rdpuser/.xsession
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
 
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          printf 'RDP_USER=rdpuser\n' >> "$GITHUB_ENV"
+          printf 'RDP_PASS=%s\n' "$PASSWORD" >> "$GITHUB_ENV"
 
-          "RDP_USER=RDP"        | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RDP_PASS=$password"  | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Configure XRDP
+        run: |
+          sudo sed -i 's/^security_layer=.*/security_layer=rdp/' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/^crypt_level=.*/crypt_level=none/' /etc/xrdp/xrdp.ini
 
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed"
-            exit 1
-          }
+          sudo systemctl restart xrdp
+
+          sleep 3
+          ss -tlnp | grep 3389 || { echo "xrdp not listening on 3389"; exit 1; }
 
       - name: Install Tailscale
-        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = Join-Path $env:TEMP "tailscale.msi"
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          sudo tailscale up \
+            --authkey="tskey-auth-kX4YXSjvP721CNTRL-V5uvfGrk9he7orzXJyMZge6w8Qu2o8z9P" \
+            --hostname="gh-runner-${GITHUB_RUN_ID}"
 
-          if (-not (Test-Path $ts)) {
-            Write-Error "tailscale.exe not found at: $ts"
+          TS_IP=""
+          for i in $(seq 1 12); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 | tr -d '[:space:]')
+            [ -n "$TS_IP" ] && break
+            sleep 5
+          done
+
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale IP not assigned. Exiting."
             exit 1
-          }
+          fi
 
-          # sobe com authkey via env (evita ${{
-          & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          printf 'TAILSCALE_IP=%s\n' "$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IPv4: $TS_IP"
 
-          $tsIP = $null
-          for ($i=0; $i -lt 12; $i++) {
-            $tsIP = (& $ts ip -4 | Select-Object -First 1).Trim()
-            if ($tsIP) { break }
-            Start-Sleep -Seconds 5
-          }
+          {
+            echo "## RDP + Tailscale"
+            echo "- Tailscale IP: **$TS_IP**"
+            echo "- RDP User: **$RDP_USER**"
+            echo "- RDP Pass: **$RDP_PASS**"
+            echo "- Port: **3389/TCP**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Exiting."
-            exit 1
-          }
-
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale IPv4: $tsIP"
-
-          "## RDP + Tailscale"                         | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- Tailscale IP: **$tsIP**"                  | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- RDP User: **$env:RDP_USER**"              | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- RDP Pass: **$env:RDP_PASS**"              | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- Port: **3389/TCP**"                       | Out-File $env:GITHUB_STEP_SUMMARY -Append
-
-      - name: Sanity Check (Tailscale + Port 3389)
-        shell: pwsh
+      - name: Sanity Check
         run: |
-          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          & $ts status
-          netstat -ano | Select-String ":3389"
-          Write-Host "Connect via RDP to: $env:TAILSCALE_IP:3389"
+          tailscale status
+          ss -tlnp | grep 3389
+          echo "Connect via RDP to: ${TAILSCALE_IP}:3389"
+
+      - name: Keep runner alive
+        run: sleep 21600
