@@ -10,6 +10,7 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -20,18 +21,20 @@ jobs:
                              -Name "SecurityLayer" -Value 0 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+
+          # Allow incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
+        shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
+
           $charSet = @{
               Upper   = [char[]](65..90)      # A-Z
               Lower   = [char[]](97..122)     # a-z
@@ -39,46 +42,85 @@ jobs:
               Special = ([char[]](33..47) + [char[]](58..64) +
                          [char[]](91..96) + [char[]](123..126)) # Special characters
           }
+
           $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
+
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create user (idempotente: se existir, remove e recria)
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
+
+          # Export creds to env (para próximos steps)
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               Write-Error "User creation failed"
               exit 1
           }
 
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        shell: pwsh
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          # Bring up Tailscale with provided auth key and unique hostname
+          & $ts up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
           # Wait for Tailscale to assign an IP
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i=0; $i -lt 10; $i++) {
+            $tsIP = (& $ts ip -4 | Select-Object -First 1).Trim()
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
           }
-          
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+            Write-Error "Tailscale IP not assigned. Exiting."
+            exit 1
+          }
+
+          Write-Host "Tailscale IPv4: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          # Summary
+          "## RDP (Windows Runner) + Tailscale" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Tailscale IP: **$tsIP**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- RDP User: **$env:RDP_USER**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- RDP Pass: **$env:RDP_PASS**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Port: **3389/TCP**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Sanity Check (RDP Port + Tailscale Status)
+        shell: pwsh
+        run: |
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          Write-Host "== tailscale status =="
+          & $ts status
+
+          Write-Host "== listening ports (3389) =="
+          netstat -ano | Select-String ":3389"
+
+          Write-Host "Use RDP to connect to: $env:TAILSCALE_IP:3389"
